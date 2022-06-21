@@ -19,8 +19,6 @@ namespace MarkdownEditor2022
             _textView = textview;
             _document = textview.TextBuffer.GetDocument();
 
-            Browser = new Browser(textview.TextBuffer.GetFileName(), _document);
-
             if (AdvancedOptions.Instance.PreviewWindowLocation == PreviewLocation.Vertical)
             {
                 CreateRightMarginControls();
@@ -30,16 +28,21 @@ namespace MarkdownEditor2022
                 CreateBottomMarginControls();
             }
 
-            UpdateBrowser(_document);
-
-            _document.Parsed += UpdateBrowser;
-            _textView.LayoutChanged += UpdatePosition;
-            _textView.TextBuffer.Changed += OnTextBufferChange;
-            AdvancedOptions.Saved += AdvancedOptions_Saved;
-
             SetResourceReference(BackgroundProperty, VsBrushes.ToolWindowBackgroundKey);
-            Browser._browser.SetResourceReference(BackgroundProperty, VsBrushes.ToolWindowBackgroundKey);
             VSColorTheme.ThemeChanged += OnThemeChange;
+
+            Browser = new Browser(textview.TextBuffer.GetFileName(), _document);
+            Browser._browser.CoreWebView2InitializationCompleted += (s, e) =>
+            {
+                UpdateBrowser(_document);
+
+                _document.Parsed += UpdateBrowser;
+                _textView.LayoutChanged += UpdatePosition;
+                _textView.TextBuffer.Changed += OnTextBufferChange;
+                AdvancedOptions.Saved += AdvancedOptions_Saved;
+
+                Browser._browser.SetResourceReference(BackgroundProperty, VsBrushes.ToolWindowBackgroundKey);
+            };
         }
 
         private void AdvancedOptions_Saved(AdvancedOptions obj)

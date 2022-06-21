@@ -3,15 +3,16 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using Markdig.Renderers;
 using Markdig.Syntax;
 using Microsoft.VisualStudio.PlatformUI;
-using mshtml;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
-using WebBrowser = System.Windows.Controls.WebBrowser;
 
 namespace MarkdownEditor2022
 {
@@ -19,7 +20,6 @@ namespace MarkdownEditor2022
     {
         private readonly string _file;
         private readonly Document _document;
-        private HTMLDocument _htmlDocument;
         private int _currentViewLine;
         private double _cachedPosition = 0,
                        _cachedHeight = 0,
@@ -34,15 +34,18 @@ namespace MarkdownEditor2022
             _document = document;
             _currentViewLine = -1;
 
-            _browser.LoadCompleted += BrowserLoadCompleted;
-            _browser.Navigating += BrowserNavigating;
+            _browser.Initialized += BrowserInitializedAsync;
+            _browser.NavigationStarting += BrowserNavigationStarting;
 
             _browser.SetResourceReference(Control.BackgroundProperty, VsBrushes.ToolWindowBackgroundKey);
         }
 
-        public readonly WebBrowser _browser = new() { HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0), Visibility = Visibility.Hidden };
+        private const string _mappedMarkdownEditorVirtualHostName = "markdown-editor-host";
+        private const string _mappedBrowsingFileVirtualHostName = "browsing-file-host";
 
-        private void BrowserNavigating(object sender, System.Windows.Navigation.NavigatingCancelEventArgs e)
+        public readonly WebView2 _browser = new() { HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0), Visibility = Visibility.Hidden };
+
+        private async void BrowserNavigationStarting(object sender, CoreWebView2NavigationStartingEventArgs e)
         {
             if (e.Uri == null)
             {
@@ -51,7 +54,7 @@ namespace MarkdownEditor2022
 
             e.Cancel = true;
 
-            Uri uri = e.Uri;
+            Uri uri = new(e.Uri);
 
             // If it's a file-based anchor we converted, open the related file if possible
             if (uri.Scheme == "about")
@@ -61,7 +64,7 @@ namespace MarkdownEditor2022
                 if (file == "blank")
                 {
                     string fragment = uri.Fragment?.TrimStart('#');
-                    NavigateToFragment(fragment);
+                    await NavigateToFragmentAsync(fragment);
                     return;
                 }
 
@@ -92,21 +95,37 @@ namespace MarkdownEditor2022
             }
         }
 
-        private void BrowserLoadCompleted(object sender, System.Windows.Navigation.NavigationEventArgs e)
+        private async void BrowserInitializedAsync(object sender, EventArgs e)
         {
+            await InitializeBrowserCoreAsync();
+            SetVirtualFolderMapping();
             _browser.Visibility = Visibility.Visible;
-            _htmlDocument = (HTMLDocument)_browser.Document;
 
-            _cachedHeight = _htmlDocument.body.offsetHeight;
-            _htmlDocument.documentElement.setAttribute("scrollTop", _positionPercentage * _cachedHeight / 100);
+            string offsetHeightResult = await _browser.ExecuteScriptAsync("document.body.offsetHeight;");
+            double.TryParse(offsetHeightResult, out _cachedHeight);
 
-            AdjustAnchors();
+            await _browser.ExecuteScriptAsync($@"document.documentElement.scrollTop={_positionPercentage * _cachedHeight / 100}");
+
+            await AdjustAnchorsAsync();
+
+            void SetVirtualFolderMapping()
+            {
+                _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(_mappedMarkdownEditorVirtualHostName, GetFolder(), CoreWebView2HostResourceAccessKind.Allow);
+                string baseHref = Path.GetDirectoryName(_file).Replace("\\", "/");
+                _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(_mappedBrowsingFileVirtualHostName, baseHref, CoreWebView2HostResourceAccessKind.Allow);
+            }
         }
 
-        private void NavigateToFragment(string fragmentId)
+        public async Task InitializeBrowserCoreAsync()
         {
-            IHTMLElement element = _htmlDocument.getElementById(fragmentId);
-            element?.scrollIntoView(true);
+            string tempDir = Path.Combine(Path.GetTempPath(), Assembly.GetExecutingAssembly().GetName().Name);
+            CoreWebView2Environment webView2Environment = await CoreWebView2Environment.CreateAsync(browserExecutableFolder: null, userDataFolder: tempDir, options: null);
+            await _browser.EnsureCoreWebView2Async(webView2Environment);
+        }
+
+        private async Task NavigateToFragmentAsync(string fragmentId)
+        {
+            await _browser.ExecuteScriptAsync($"document.getElementById(\"{fragmentId}\").scrollIntoView(true)");
         }
 
         /// <summary>
@@ -115,46 +134,29 @@ namespace MarkdownEditor2022
         /// <remarks>Anchors using the "file:" protocol appear to be blocked by security settings and won't work.
         /// If we convert them to use the "about:" protocol so that we recognize them, we can open the file in
         /// the <c>Navigating</c> event handler.</remarks>
-        private void AdjustAnchors()
+        private async Task AdjustAnchorsAsync()
         {
-            try
-            {
-                foreach (IHTMLElement link in _htmlDocument.links)
-                {
-                    if (link is HTMLAnchorElement anchor && anchor.protocol == "file:")
-                    {
-                        string pathName = null, hash = anchor.hash;
-
-                        // Anchors with a hash cause a crash if you try to set the protocol without clearing the
-                        // hash and path name first.
-                        if (hash != null)
-                        {
+            string script = @"
+                for (const anchor of document.links) {
+                    if (anchor != null && anchor.protocol == 'file:') {
+                        var pathName = null, hash = anchor.hash;
+                        if (hash != null) {
                             pathName = anchor.pathname;
                             anchor.hash = null;
-                            anchor.pathname = string.Empty;
+                            anchor.pathname = '';
                         }
+                        anchor.protocol = 'about:';
 
-                        anchor.protocol = "about:";
-
-                        if (hash != null)
-                        {
-                            // For an in-page section link, use "blank" as the path name.  These don't work
-                            // anyway but this is the proper way to handle them.
-                            if (pathName == null || pathName.EndsWith("/"))
-                            {
-                                pathName = "blank";
+                        if (hash != null) {
+                            if (pathName == null || pathName.endsWith('/')) {
+                                pathName = 'blank';
                             }
-
                             anchor.pathname = pathName;
                             anchor.hash = hash;
                         }
                     }
-                }
-            }
-            catch
-            {
-                // Ignore exceptions
-            }
+                }";
+            await _browser.ExecuteScriptAsync(script.Replace("\r", "\\r").Replace("\n", "\\n"));
         }
 
         public Task UpdatePositionAsync(int line, bool isTyping)
@@ -164,68 +166,82 @@ namespace MarkdownEditor2022
                 return Task.CompletedTask;
             }
 
-            return ThreadHelper.JoinableTaskFactory.StartOnIdle(() =>
+            return ThreadHelper.JoinableTaskFactory.StartOnIdle(async () =>
             {
                 _currentViewLine = _document.Markdown.FindClosestLine(line);
-                SyncNavigation(isTyping);
+                await SyncNavigationAsync(isTyping);
             }, VsTaskRunContext.UIThreadIdlePriority).Task;
         }
 
-        private void SyncNavigation(bool isTyping)
+        private async Task SyncNavigationAsync(bool isTyping)
         {
-            if (_htmlDocument != null)
+            if (!await IsHtmlTemplateLoadedAsync())
             {
                 if (_currentViewLine == 0)
                 {
                     // Forces the preview window to scroll to the top of the document
-                    _htmlDocument.documentElement.setAttribute("scrollTop", 0);
+                    await _browser.ExecuteScriptAsync("document.documentElement.scrollTop=0;");
                 }
                 else
                 {
-                    IHTMLElement element = _htmlDocument.getElementById("pragma-line-" + _currentViewLine);
-                    if (element != null)
+                    // When typing, scroll the edited element into view a bit under the top...
+                    if (isTyping)
                     {
-                        // When typing, scroll the edited element into view a bit under the top...
-                        if (isTyping)
-                        {
-                            IHTMLElement2 docElm = (IHTMLElement2)_htmlDocument.documentElement;
-                            int scrollPos = docElm.scrollTop;
-                            int windowHeight = docElm.clientHeight;
+                        string scrollScript = @$"
+                            let element = document.getElementById('pragma-line-{_currentViewLine}');
+                            let docElm = document.documentElement;
+                            // Do not scroll if element is already on screen
+                            if (element.offsetTop < scrollPos || element.offsetTop > scrollPos + windowHeight) return;
 
-                            // ...but only if it isn't already visible on screen
-                            if (element.offsetTop < scrollPos || element.offsetTop > scrollPos + windowHeight)
-                            {
-                                docElm.scrollTop = element.offsetTop - 200;
-                            }
-                        }
-                        else
-                        {
-                            element.scrollIntoView(true);
-                        }
+                            document.documentElement.scrollTop = element.offsetTop - 200;
+                            ";
+                        await _browser.ExecuteScriptAsync(scrollScript);
+                    }
+                    else
+                    {
+                        await _browser.ExecuteScriptAsync($@"document.getElementById(""pragma-line-{_currentViewLine}"").scrollIntoView(true);");
                     }
                 }
             }
-            else if (_htmlDocument != null)
+            else
             {
                 _currentViewLine = -1;
-                _cachedPosition = _htmlDocument.documentElement.getAttribute("scrollTop");
-                _cachedHeight = Math.Max(1.0, _htmlDocument.body.offsetHeight);
+                string result = await _browser.ExecuteScriptAsync("document.documentElement.scrollTop;");
+                double.TryParse(result, out _cachedPosition);
+                result = await _browser.ExecuteScriptAsync("document.body.offsetHeight;");
+                double.TryParse(result, out _cachedHeight);
+
                 _positionPercentage = _cachedPosition * 100 / _cachedHeight;
             }
         }
 
         public Task RefreshAsync()
         {
-            _htmlDocument = null;
             return UpdateBrowserAsync();
         }
 
-        public Task UpdateBrowserAsync()
+        private async Task<bool> IsHtmlTemplateLoadedAsync()
         {
-            return ThreadHelper.JoinableTaskFactory.StartOnIdle(() =>
+            string hasContentResult = await _browser.ExecuteScriptAsync($@"document.getElementById(""___markdown-content___"") !== null;");
+            return hasContentResult == "true";
+        }
+
+        public async Task UpdateBrowserAsync()
+        {
+            try
+            {
+            string html = await RenderHtmlDocumentAsync(_document.Markdown);
+
+            await UpdateContentAsync(html);
+
+            await SyncNavigationAsync(isTyping: false);
+            } catch(Exception e)
+            {
+            }
+
+            async static Task<string> RenderHtmlDocumentAsync(MarkdownDocument md)
             {
                 // Generate the HTML document
-                string html = null;
                 StringWriter htmlWriter = null;
                 try
                 {
@@ -235,43 +251,42 @@ namespace MarkdownEditor2022
                     HtmlRenderer htmlRenderer = new(htmlWriter);
                     Document.Pipeline.Setup(htmlRenderer);
                     htmlRenderer.UseNonAsciiNoEscape = true;
-                    htmlRenderer.Render(_document.Markdown);
+                    htmlRenderer.Render(md);
 
-                    htmlWriter.Flush();
-                    html = htmlWriter.ToString();
+                    await htmlWriter.FlushAsync();
+                    string html = htmlWriter.ToString();
                     html = Regex.Replace(html, "\"language-(c|C)#\"", "\"language-csharp\"", RegexOptions.Compiled);
+                    return html;
                 }
                 catch (Exception ex)
                 {
                     // We could output this to the exception pane of VS?
                     // Though, it's easier to output it directly to the browser
-                    html = "<p>An unexpected exception occurred:</p><pre>" +
-                           ex.ToString().Replace("<", "&lt;").Replace("&", "&amp;") + "</pre>";
+                    return "<p>An unexpected exception occurred:</p><pre>" +
+                            ex.ToString().Replace("<", "&lt;").Replace("&", "&amp;") + "</pre>";
                 }
                 finally
                 {
                     // Free any resources allocated by HtmlWriter
                     htmlWriter?.GetStringBuilder().Clear();
                 }
+            }
 
-                IHTMLElement content = null;
-
-                if (_htmlDocument != null)
+            async Task UpdateContentAsync(string html)
+            {
+                bool isInit = await IsHtmlTemplateLoadedAsync();
+                if (isInit)
                 {
-                    content = _htmlDocument.getElementById("___markdown-content___");
-                }
-
-                // Content may be null if the Refresh context menu option is used.  If so, reload the template.
-                if (content != null)
-                {
-                    content.innerHTML = html;
+                    html = html.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\"", "\\\"");
+                    await _browser.ExecuteScriptAsync($@"document.getElementById(""___markdown-content___"").innerHTML=""{html}"";");
 
                     // Makes sure that any code blocks get syntax highlighted by Prism
-                    IHTMLWindow2 win = _htmlDocument.parentWindow;
-                    try { win.execScript("Prism.highlightAll();", "javascript"); } catch { }
+                    await _browser.ExecuteScriptAsync("Prism.highlightAll();");
+                    await _browser.ExecuteScriptAsync("mermaid.init(undefined, document.querySelectorAll('.mermaid'));");
+                    await _browser.ExecuteScriptAsync("if (typeof onMarkdownUpdate == 'function') onMarkdownUpdate();");
 
                     // Adjust the anchors after and edit
-                    AdjustAnchors();
+                    await AdjustAnchorsAsync();
                 }
                 else
                 {
@@ -280,8 +295,7 @@ namespace MarkdownEditor2022
                     html = htmlTemplate.Replace("[content]", html);
                     _browser.NavigateToString(html);
                 }
-
-            }, VsTaskRunContext.UIThreadIdlePriority).Task;
+            }
         }
 
         public static string GetFolder()
@@ -304,6 +318,7 @@ namespace MarkdownEditor2022
             string cssFile = Path.Combine(folder, "margin\\highlight.css");
             string scriptPrismPath = Path.Combine(folder, "margin\\prism.js");
             string cssPrism = File.ReadAllText(Path.Combine(folder, "margin\\prism.css"));
+            string scriptMermaidPath = Path.Combine(folder, "margin\\mermaid.min.js");
 
             bool useLightTheme = AdvancedOptions.Instance.Theme == Theme.Light;
 
@@ -339,7 +354,9 @@ namespace MarkdownEditor2022
     <div id=""___markdown-content___"" class=""markdown-body"">
         [content]
     </div>
-    <script async src=""{scriptPrismPath}""></script>";
+    <script async src=""{scriptPrismPath}""></script>
+    <script async src=""{scriptMermaidPath}""></script>
+    ";
 
             string templateFileName = GetHtmlTemplateFileNameFromResource();
             string template = File.ReadAllText(templateFileName);
@@ -373,12 +390,10 @@ namespace MarkdownEditor2022
         {
             if (_browser != null)
             {
-                _browser.LoadCompleted -= BrowserLoadCompleted;
-                _browser.Navigating -= BrowserNavigating;
+                _browser.Initialized -= BrowserInitializedAsync;
+                _browser.NavigationStarting -= BrowserNavigationStarting;
                 _browser.Dispose();
             }
-
-            _htmlDocument = null;
         }
     }
 }
